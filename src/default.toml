@@ -1,0 +1,46 @@
+# Specify the root path of Arch linux to calculate the diff.
+rootdir = "/"
+# The path of the pacman database
+dbpath = "/var/lib/pacman/"
+# Specify the location to search for pkg.
+cachedir = [
+  "/var/cache/pacman/pkg/",
+  "{{cache}}/yay/",
+  "{{cache}}/paru/",
+]
+# Candidates for pkg extension.
+exts = [
+  ".pkg.tar.xz",
+  ".pkg.tar.zst",
+]
+
+ignore = [
+  "/var/cache/pacman/pkg/",
+  "/var/lib/docker/",
+# Because nvidia changes the following files in its hook, ignore them.
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.alias",
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.alias.bin",
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.dep",
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.dep.bin",
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.symbols",
+  "/usr/lib/modules/{{replace package_info.linux.version \".arch\" \"-arch\"}}/modules.symbols.bin",
+  "/usr/share/mime/",
+  "/etc/fonts/conf.d",
+  "/etc/shells",
+  "/etc/ssl/certs/",
+  "/var/log/",
+  "/home/"
+]
+
+# Ignore files that belong to the following file systems
+ignorefs = [
+  "devtmpfs",
+  "proc",
+  "sysfs",
+  "tmpfs",
+]
+
+# Do not calculate diff for files larger than this
+max_text_size = 10485760
+# If all files under a directory are unmanaged and there are more than this number, do not calculate the diff for each one
+min_merge_file = 100
