@@ -1,3 +1,5 @@
+#![feature(iterator_try_reduce)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use console::{style, Style};
@@ -137,7 +139,7 @@ fn print_diff(expected: &str, actual: &str) {
                 let (sign, s) = match change.tag() {
                     similar::ChangeTag::Delete => ("-", Style::new().red()),
                     similar::ChangeTag::Insert => ("+", Style::new().green()),
-                    similar::ChangeTag::Equal => (" ", Style::new().dim()),
+                    similar::ChangeTag::Equal => (" ", Style::new()),
                 };
                 print!("{}", s.apply_to(sign));
                 for (emphasized, value) in change.iter_strings_lossy() {
@@ -156,9 +158,7 @@ fn print_diff(expected: &str, actual: &str) {
 }
 
 fn main() -> Result<()> {
-    env_logger::init_from_env(
-        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
-    );
+    env_logger::init();
 
     let args = Cli::parse();
 

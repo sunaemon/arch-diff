@@ -5,6 +5,7 @@ use super::Settings;
 use anyhow::{anyhow, Context, Result};
 use either::Either;
 use handlebars::handlebars_helper;
+use indicatif::{ParallelProgressIterator, ProgressIterator};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -66,6 +67,20 @@ impl GetPkgLocation {
     }
 }
 
+fn new_progress_bar(len: usize, msg: &str) -> indicatif::ProgressBar {
+    let bar = indicatif::ProgressBar::new(len.try_into().unwrap());
+    bar.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template(
+                &(format!("{:<25}", msg)
+                    + " {elapsed_precise} [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}"),
+            )
+            .progress_chars("=> ")
+            .on_finish(indicatif::ProgressFinish::AndLeave),
+    );
+    bar
+}
+
 #[derive(Serialize, Debug)]
 struct PkgInfo {
     version: String,
@@ -117,9 +132,11 @@ fn get_entries(settings: &Settings) -> Result<(HashMap<PathBuf, MTreeEntryData>,
 
     let pkg_candidates = GetPkgLocation::new(&env_info, &settings)?;
 
+    let pkgs = handle.localdb().pkgs();
+    let bar = new_progress_bar(pkgs.len(), "Reading mtree       (1/4)");
     log::info!("Reading mtree...");
     let mut entries = HashMap::new();
-    for pkg in handle.localdb().pkgs() {
+    for pkg in pkgs.iter().progress_with(bar) {
         log::debug!("Reading pkg: {:?}", pkg);
 
         let name = pkg.name().to_string();
@@ -244,7 +261,7 @@ impl IsIgnored {
 
         for pattern in &self.ignore {
             if path.starts_with(pattern) {
-                return Some(IgnoredReason::ByPattern(fstype.to_string()));
+                return Some(IgnoredReason::ByPattern(pattern.to_string()));
             }
         }
 
@@ -334,7 +351,10 @@ fn calc_file_diff(
     jobs: Vec<(PathBuf, Defer)>,
     settings: &Settings,
 ) -> Result<Vec<(PathBuf, CommonDiff, FileDiff)>> {
+    let bar = new_progress_bar(jobs.len(), "Calculating hash    (3/4)");
+    bar.set_draw_delta(1000);
     jobs.into_par_iter()
+        .progress_with(bar)
         .map(|(path, defer)| -> Result<_> {
             let Defer {
                 common_diff,
@@ -381,10 +401,12 @@ fn fetch_contents(
     env_info: &EnvInfo,
     settings: &Settings,
 ) -> Result<Vec<(PathBuf, CommonDiff, FileContent)>> {
+    let bar = new_progress_bar(jobs.len(), "Unarchive contents  (4/4)");
     jobs.par_iter()
+        .progress_with(bar)
         .map(|(pkg, diffs)| -> Result<_> {
             let mut text_diffs = Vec::new();
-            let pkgfile = &env_info.package_info[pkg].file;
+            let pkgfile = &env_info.package_info.get(&pkg.clone()).unwrap().file;
             let mut builder = libarchive::reader::Builder::new();
             builder
                 .support_filter(libarchive::archive::ReadFilter::All)
@@ -511,6 +533,8 @@ fn calc_diff(
     let mut dirs = vec![settings.rootdir.to_path_buf()];
     let mut jobs: Vec<(PathBuf, Defer)> = Vec::new();
     let mut unmanaged_entries = BTreeSet::new();
+    let bar = new_progress_bar(entries.len(), "Traverse filesystem (2/4)");
+    bar.set_draw_delta(1000);
     loop {
         let next = match dirs.pop() {
             None => break,
@@ -530,7 +554,13 @@ fn calc_diff(
             let path = p.path().to_path_buf();
 
             if let Some(ignore_reason) = is_ignored.check(&path) {
-                entries.retain(|p, _| !p.starts_with(&path));
+                entries.retain(|p, _| {
+                    let retain = !p.starts_with(&path);
+                    if !retain {
+                        bar.inc(1);
+                    }
+                    retain
+                });
                 diffs.insert(path, Diff::Ignored(ignore_reason));
                 continue;
             }
@@ -540,15 +570,18 @@ fn calc_diff(
                     unmanaged_entries.insert(path);
                     continue;
                 }
-                Some(e) => match diff_direntry(p, e, settings)
-                    .with_context(|| format!("diff Calculation for {:?} failed", &path))?
-                {
-                    Either::Left(diff) => diff,
-                    Either::Right(defer) => {
-                        jobs.push((path, defer));
-                        continue;
+                Some(e) => {
+                    bar.inc(1);
+                    match diff_direntry(p, e, settings)
+                        .with_context(|| format!("diff Calculation for {:?} failed", &path))?
+                    {
+                        Either::Left(diff) => diff,
+                        Either::Right(defer) => {
+                            jobs.push((path, defer));
+                            continue;
+                        }
                     }
-                },
+                }
             };
 
             match &diff {
@@ -571,8 +604,18 @@ fn calc_diff(
         }
     }
 
+    let mut archive_fetch_jobs: HashMap<String, Vec<(PathBuf, CommonDiff)>> = HashMap::new();
+    for (path, e) in entries.into_iter() {
+        bar.inc(1);
+        archive_fetch_jobs
+            .entry(e.package.to_string())
+            .or_insert(Vec::new())
+            .push((path, CommonDiff::default()));
+    }
+
+    bar.finish();
+
     log::info!("Checking file diff...");
-    let mut text_diff_jobs: HashMap<String, Vec<(PathBuf, CommonDiff)>> = HashMap::new();
     for (path, common_diff, file_diff) in calc_file_diff(jobs, settings)? {
         match (common_diff, file_diff) {
             (common_diff, FileDiff::Binary) => {
@@ -581,7 +624,7 @@ fn calc_diff(
                     Diff::Managed(common_diff, ManagedDiff::File(Some(ContentDiff::Binary))),
                 );
             }
-            (common_diff, FileDiff::Text { package }) => text_diff_jobs
+            (common_diff, FileDiff::Text { package }) => archive_fetch_jobs
                 .entry(package.to_string())
                 .or_insert(Vec::new())
                 .push((path, common_diff)),
@@ -595,15 +638,9 @@ fn calc_diff(
             }
         }
     }
-    for (path, e) in entries.into_iter() {
-        text_diff_jobs
-            .entry(e.package.to_string())
-            .or_insert(Vec::new())
-            .push((path, CommonDiff::default()));
-    }
 
     log::info!("Generating text diff...");
-    for (path, common_diff, expected) in fetch_contents(&text_diff_jobs, &env_info, settings)? {
+    for (path, common_diff, expected) in fetch_contents(&archive_fetch_jobs, &env_info, settings)? {
         let actual = match read_content(&path, settings)? {
             Some(Content::File(file_content)) => Some(file_content),
             None => None,
