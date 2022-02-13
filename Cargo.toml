@@ -1,5 +1,5 @@
 [package]
-name = "arch-diff"
+name = "arch-diff-backup"
 version = "0.1.0"
 authors = ["Sunahara Yuu <dev@sunaemon.dev>"]
 edition = "2021"
