@@ -25,13 +25,10 @@ impl GetPkgLocation {
             if !dir.is_dir() {
                 continue;
             }
-            for entry in walkdir::WalkDir::new(dir) {
-                let entry = entry?;
+            for entry in walkdir::WalkDir::new(&dir) {
+                let entry = entry.with_context(|| format!("lstat failed for {:?}", dir))?;
                 let path = entry.path();
-                let filename = entry
-                    .file_name()
-                    .to_str()
-                    .ok_or_else(|| anyhow!("Cannot parse filename as UTF-8: {:?}", entry))?;
+                let filename = o2s(entry.file_name())?;
                 for ext in &settings.exts {
                     if filename.ends_with(ext) {
                         let stem = filename.strip_suffix(ext).unwrap().to_string();
@@ -67,8 +64,11 @@ impl GetPkgLocation {
     }
 }
 
-fn new_progress_bar(len: usize, msg: &str) -> indicatif::ProgressBar {
-    let bar = indicatif::ProgressBar::new(len.try_into().unwrap());
+fn progress_bar(len: usize, msg: &str) -> Result<indicatif::ProgressBar> {
+    let len = len
+        .try_into()
+        .with_context(|| format!("len is too big to create progress bar: {:?}", len))?;
+    let bar = indicatif::ProgressBar::new(len);
     bar.set_style(
         indicatif::ProgressStyle::default_bar()
             .template(
@@ -78,7 +78,8 @@ fn new_progress_bar(len: usize, msg: &str) -> indicatif::ProgressBar {
             .progress_chars("=> ")
             .on_finish(indicatif::ProgressFinish::AndLeave),
     );
-    bar
+    bar.set_draw_delta(len / 100);
+    Ok(bar)
 }
 
 #[derive(Serialize, Debug)]
@@ -100,7 +101,10 @@ handlebars_helper!(replace: |s: str, pattern: str, to:str| s.to_string().replace
 fn render(template: &str, env_info: &EnvInfo) -> Result<String> {
     let mut hbs = handlebars::Handlebars::new();
     hbs.register_helper("replace", Box::new(replace));
-    Ok(hbs.render_template(template, &serde_json::json!(env_info))?)
+    let rendered = hbs
+        .render_template(template, &serde_json::json!(env_info))
+        .with_context(|| format!("failed to render: {:?} with env: {:?}", template, env_info))?;
+    Ok(rendered)
 }
 
 fn get_entries(settings: &Settings) -> Result<(HashMap<PathBuf, MTreeEntryData>, EnvInfo)> {
@@ -133,7 +137,7 @@ fn get_entries(settings: &Settings) -> Result<(HashMap<PathBuf, MTreeEntryData>,
     let pkg_candidates = GetPkgLocation::new(&env_info, &settings)?;
 
     let pkgs = handle.localdb().pkgs();
-    let bar = new_progress_bar(pkgs.len(), "Reading mtree       (1/4)");
+    let bar = progress_bar(pkgs.len(), "Reading mtree       (1/4)")?;
     log::info!("Reading mtree...");
     let mut entries = HashMap::new();
     for pkg in pkgs.iter().progress_with(bar) {
@@ -153,7 +157,10 @@ fn get_entries(settings: &Settings) -> Result<(HashMap<PathBuf, MTreeEntryData>,
             },
         );
 
-        for file in pkg.mtree()? {
+        for file in pkg
+            .mtree()
+            .with_context(|| format!("failed to get mgree for {:?}", pkg))?
+        {
             let path = {
                 let path = file.pathname();
                 let path = path.strip_prefix("./").ok_or(anyhow!(
@@ -184,8 +191,8 @@ fn get_entries(settings: &Settings) -> Result<(HashMap<PathBuf, MTreeEntryData>,
             let entry = MTreeEntryData {
                 content,
                 mtime: unsafe { libarchive3_sys::ffi::archive_entry_mtime(file.entry()) },
-                uid: unsafe { libarchive3_sys::ffi::archive_entry_uid(file.entry()) }.try_into()?,
-                gid: unsafe { libarchive3_sys::ffi::archive_entry_gid(file.entry()) }.try_into()?,
+                uid: unsafe { libarchive3_sys::ffi::archive_entry_uid(file.entry()) } as u32,
+                gid: unsafe { libarchive3_sys::ffi::archive_entry_gid(file.entry()) } as u32,
                 mode: unsafe { libarchive3_sys::ffi::archive_entry_mode(file.entry()) },
                 package: name.to_string(),
             };
@@ -351,8 +358,8 @@ fn calc_file_diff(
     jobs: Vec<(PathBuf, Defer)>,
     settings: &Settings,
 ) -> Result<Vec<(PathBuf, CommonDiff, FileDiff)>> {
-    let bar = new_progress_bar(jobs.len(), "Calculating hash    (3/4)");
-    bar.set_draw_delta(1000);
+    let bar = progress_bar(jobs.len(), "Calculating hash    (3/4)")?;
+    log::info!("Calculating hash...");
     jobs.into_par_iter()
         .progress_with(bar)
         .map(|(path, defer)| -> Result<_> {
@@ -401,7 +408,8 @@ fn fetch_contents(
     env_info: &EnvInfo,
     settings: &Settings,
 ) -> Result<Vec<(PathBuf, CommonDiff, FileContent)>> {
-    let bar = new_progress_bar(jobs.len(), "Unarchive contents  (4/4)");
+    let bar = progress_bar(jobs.len(), "Unarchive contents  (4/4)")?;
+    log::info!("Unarchive contents...");
     jobs.par_iter()
         .progress_with(bar)
         .map(|(pkg, diffs)| -> Result<_> {
@@ -436,10 +444,10 @@ fn fetch_contents(
                             })? {
                                 None => break true,
                                 Some(b) => {
-                                    if data.len() + b.len()
-                                        > settings.max_text_size.try_into().unwrap()
-                                    {
-                                        break false;
+                                    if let Ok(max_text_size) = settings.max_text_size.try_into() {
+                                        if data.len() + b.len() > max_text_size {
+                                            break false;
+                                        }
                                     }
 
                                     data.extend(b)
@@ -528,13 +536,11 @@ fn calc_diff(
     let mountinfo = procinfo.mountinfo()?;
     let is_ignored = IsIgnored::new(settings, mountinfo, env_info)?;
 
-    log::info!("Checking metainfo...");
-
     let mut dirs = vec![settings.rootdir.to_path_buf()];
     let mut jobs: Vec<(PathBuf, Defer)> = Vec::new();
     let mut unmanaged_entries = BTreeSet::new();
-    let bar = new_progress_bar(entries.len(), "Traverse filesystem (2/4)");
-    bar.set_draw_delta(1000);
+    let bar = progress_bar(entries.len(), "Traverse filesystem (2/4)")?;
+    log::info!("Traverse filesystem...");
     loop {
         let next = match dirs.pop() {
             None => break,
@@ -615,7 +621,6 @@ fn calc_diff(
 
     bar.finish();
 
-    log::info!("Checking file diff...");
     for (path, common_diff, file_diff) in calc_file_diff(jobs, settings)? {
         match (common_diff, file_diff) {
             (common_diff, FileDiff::Binary) => {
@@ -639,7 +644,6 @@ fn calc_diff(
         }
     }
 
-    log::info!("Generating text diff...");
     for (path, common_diff, expected) in fetch_contents(&archive_fetch_jobs, &env_info, settings)? {
         let actual = match read_content(&path, settings)? {
             Some(Content::File(file_content)) => Some(file_content),
@@ -699,8 +703,10 @@ fn calc_diff(
                 log::debug!("{:?} unmached, {:?}", unmanaged_entries_parent, diff);
             } else {
                 log::debug!("{:?} mached", unmanaged_entries_parent);
-                if diff.len() > settings.min_merge_file.try_into().unwrap() {
-                    unmanaged_entries_parents_merged.insert(unmanaged_entries_parent);
+                if let Ok(min_merge_file) = settings.min_merge_file.try_into() {
+                    if diff.len() > min_merge_file {
+                        unmanaged_entries_parents_merged.insert(unmanaged_entries_parent);
+                    }
                 }
             }
         }
@@ -723,11 +729,12 @@ fn calc_diff(
 
         for path in &unmanaged_entries {
             if path.is_dir() {
-                let stats = get_entry_num(&path).unwrap();
+                let stats = get_entry_num(&path)?;
                 if stats.entries < settings.min_merge_file.into() {
                     for entry in walkdir::WalkDir::new(path) {
-                        let entry = entry.unwrap();
-                        let content = read_content(entry.path(), settings).unwrap().unwrap();
+                        let entry = entry?;
+                        let content = read_content(entry.path(), settings)?
+                            .ok_or(anyhow!("{:?} does not exists", entry.path()))?;
                         diffs.insert(
                             entry.path().to_path_buf(),
                             Diff::Unmanaged(UnmanagedDiff::Single(content), None),
@@ -740,7 +747,8 @@ fn calc_diff(
                     );
                 }
             } else {
-                let content = read_content(&path, settings).unwrap().unwrap();
+                let content =
+                    read_content(path, settings)?.ok_or(anyhow!("{:?} does not exists", path))?;
                 diffs.insert(
                     path.to_path_buf(),
                     Diff::Unmanaged(UnmanagedDiff::Single(content), None),
@@ -749,7 +757,7 @@ fn calc_diff(
         }
 
         for path in &unmanaged_entries_parents_merged {
-            let stats = get_entry_num(&path).unwrap();
+            let stats = get_entry_num(&path)?;
             diffs.insert(
                 path.to_path_buf(),
                 Diff::Unmanaged(UnmanagedDiff::All, Some(stats)),

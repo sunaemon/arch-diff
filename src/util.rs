@@ -1,9 +1,14 @@
-use anyhow::{anyhow, Result};
+use std::ffi::OsStr;
 use std::path::Path;
+use std::str::Utf8Error;
 
-pub fn p2s(p: &Path) -> Result<&str> {
-    p.to_str()
-        .ok_or(anyhow!("path cannot be parsed in UTF-8: {:?}", &p))
+pub fn p2s(p: &Path) -> Result<&str, Utf8Error> {
+    o2s(p.as_os_str())
+}
+
+pub fn o2s(o: &OsStr) -> Result<&str, Utf8Error> {
+    use std::os::unix::ffi::OsStrExt;
+    std::str::from_utf8(o.as_bytes())
 }
 
 pub fn calc_sha256<'a>(path: &Path) -> Result<[u8; 32], std::io::Error> {
